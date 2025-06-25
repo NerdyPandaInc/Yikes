@@ -1,0 +1,335 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+/// @title JINDO Token (Upgradeable, Permit, Dynamic Fees, RFI + Burn)
+/// @notice ERC-20 + Reflection + Burn-only tax + Cooldown + Blacklist + Pause + UUPS + Permit
+contract JINDO is
+    Initializable,
+    ERC20PermitUpgradeable,
+    OwnableUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // ───────────────────────────────────────────────────────────────────
+    // EVENTS
+    // ───────────────────────────────────────────────────────────────────
+
+    /// @notice Emitted when reflection or burn fee is updated
+    event FeesUpdated(uint16 reflectionFee, uint16 burnFee);
+    /// @notice Emitted once trading is opened
+    event TradingEnabled();
+    /// @notice Emitted when cooldown is changed
+    event CooldownUpdated(uint256 oldCd, uint256 newCd);
+    /// @notice Emitted when an address is blacklisted/unblacklisted
+    event Blacklisted(address indexed user, bool flagged);
+    /// @notice Emitted when an address is excluded/included from fees
+    event FeeExclusion(address indexed acct, bool excluded);
+    /// @notice Emitted when a tax is taken on transfer
+    event TaxTaken(address indexed from, uint256 tFee, uint256 tBurn);
+    /// @notice Emitted when stray ERC20 is recovered
+    event RecoveredERC20(address token, address to, uint256 amount);
+    /// @notice Emitted when stray ETH is recovered
+    event RecoveredETH(address to, uint256 amount);
+    /// @notice Emitted when a special wallet address changes
+    event DevWalletUpdated(address oldW, address newW);
+    event TreasuryWalletUpdated(address oldW, address newW);
+    event LiquidityWalletUpdated(address oldW, address newW);
+    event BurnWalletUpdated(address oldW, address newW);
+
+    // ───────────────────────────────────────────────────────────────────
+    // CONSTANTS & CAPS
+    // ───────────────────────────────────────────────────────────────────
+
+    uint256 private constant _INITIAL_SUPPLY = 180_000_000_000_000 * 1e18;
+    uint16  public  constant MAX_REFLECTION_FEE = 200;  // ≤2.00%
+    uint16  public  constant MAX_BURN_FEE       = 800;  // ≤8.00%
+
+    // ───────────────────────────────────────────────────────────────────
+    // STORAGE LAYOUT (do not reorder)
+    // ───────────────────────────────────────────────────────────────────
+
+    uint256 private _rTotal;          // reflected total
+    uint256 private _tFeeTotal;       // cumulative reflection fees
+
+    mapping(address => uint256)                   private _rOwned;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    mapping(address => bool) private _isExcludedFromFee;
+    mapping(address => bool) private _isBlacklisted;
+    mapping(address => uint256) private _lastTrade;
+
+    address public devWallet;
+    address public treasuryWallet;
+    address public liquidityWallet;
+    address public burnWallet;
+
+    uint256 public cooldown;        // seconds per address
+    bool    public tradingEnabled;  // launch switch
+
+    uint16 public reflectionFeeBP;  // in bps: 100 bp = 1%
+    uint16 public burnFeeBP;        // in bps
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() { _disableInitializers(); }
+
+    /// @notice Initialize JINDO and assign supply & settings
+    function initialize(
+        address _dev,
+        address _treasury,
+        address _liquidity,
+        address _burn
+    ) external initializer {
+        __ERC20_init("JINDO Token", "JINDO");
+        __ERC20Permit_init("JINDO Token");
+        __Ownable_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        require(_dev       != address(0), "JINDO: zero dev");
+        require(_treasury  != address(0), "JINDO: zero treas");
+        require(_liquidity != address(0), "JINDO: zero liq");
+        require(_burn      != address(0), "JINDO: zero burn");
+
+        devWallet       = _dev;
+        treasuryWallet  = _treasury;
+        liquidityWallet = _liquidity;
+        burnWallet      = _burn;
+
+        // Reflection setup
+        _rTotal               = (type(uint256).max - (type(uint256).max % _INITIAL_SUPPLY));
+        _rOwned[_msgSender()] = _rTotal;
+
+        // Defaults
+        cooldown        = 20 seconds;
+        tradingEnabled  = false;
+        reflectionFeeBP = 140;  // 1.4%
+        burnFeeBP       = 560;  // 5.6%
+
+        // Exclude deployer + 3 wallets (burnWallet is taxed)
+        _isExcludedFromFee[_msgSender()]  = true;
+        _isExcludedFromFee[_dev]          = true;
+        _isExcludedFromFee[_treasury]     = true;
+        _isExcludedFromFee[_liquidity]    = true;
+
+        emit FeesUpdated(reflectionFeeBP, burnFeeBP);
+        emit Transfer(address(0), _msgSender(), _INITIAL_SUPPLY);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ERC20 + RFI VIEWS
+    // ───────────────────────────────────────────────────────────────────
+
+    function totalSupply() public pure override returns (uint256) {
+        return _INITIAL_SUPPLY;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _rOwned[account] / _getRate();
+    }
+
+    function allowance(address owner_, address spender) public view override returns (uint256) {
+        return _allowances[owner_][spender];
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ERC20 STATE CHANGES
+    // ───────────────────────────────────────────────────────────────────
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transfer(address to, uint256 amount)
+        public
+        override
+        whenNotPaused
+        returns (bool)
+    {
+        _transfer(_msgSender(), to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        override
+        whenNotPaused
+        returns (bool)
+    {
+        _transfer(from, to, amount);
+        _approve(from, _msgSender(), _allowances[from][_msgSender()] - amount);
+        return true;
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // INTERNAL HELPERS
+    // ───────────────────────────────────────────────────────────────────
+
+    function _approve(address owner_, address spender, uint256 amount) internal {
+        require(owner_ != address(0) && spender != address(0), "JINDO: zero addr");
+        _allowances[owner_][spender] = amount;
+        emit Approval(owner_, spender, amount);
+    }
+
+    function _transfer(address from, address to, uint256 tAmount) internal {
+        require(from != address(0) && to != address(0), "JINDO: zero addr");
+        require(!_isBlacklisted[from] && !_isBlacklisted[to], "JINDO: blacklisted");
+        require(balanceOf(from) >= tAmount, "JINDO: insufficient");
+        require(tradingEnabled || _isExcludedFromFee[from], "JINDO: disabled");
+        require(block.timestamp >= _lastTrade[from] + cooldown, "JINDO: cooldown");
+
+        _lastTrade[from] = block.timestamp;
+
+        uint256 currentRate = _getRate();
+        uint256 rAmount     = tAmount * currentRate;
+        uint256 rTransfer;
+        uint256 tTransfer;
+
+        bool takeFee = !(_isExcludedFromFee[from] || _isExcludedFromFee[to]);
+        if (takeFee) {
+            // calculate dynamic fees
+            uint256 tFee  = (tAmount * reflectionFeeBP) / 10000;
+            uint256 tBurn = (tAmount * burnFeeBP)       / 10000;
+            tTransfer     = tAmount - tFee - tBurn;
+
+            uint256 rFee  = tFee  * currentRate;
+            uint256 rBurn = tBurn * currentRate;
+            rTransfer     = rAmount - rFee - rBurn;
+
+            // reflect
+            _rTotal    -= rFee;
+            _tFeeTotal += tFee;
+
+            // burn sink
+            _rOwned[burnWallet] += rBurn;
+            emit Transfer(from, burnWallet, tBurn);
+
+            emit TaxTaken(from, tFee, tBurn);
+
+            // invariant: rTotal must be multiple of supply
+            require(_rTotal % _INITIAL_SUPPLY == 0, "JINDO: rate invariant");
+
+            // rounding dust (rare) -> treasury
+            uint256 dust = (rFee + rBurn + rTransfer) - rAmount;
+            if (dust > 0) {
+                uint256 tDust = dust / currentRate;
+                _rOwned[treasuryWallet] += dust;
+                emit Transfer(address(this), treasuryWallet, tDust);
+            }
+        } else {
+            rTransfer = rAmount;
+            tTransfer = tAmount;
+        }
+
+        _rOwned[from] -= rAmount;
+        _rOwned[to]   += rTransfer;
+        emit Transfer(from, to, tTransfer);
+    }
+
+    function _getRate() private view returns (uint256) {
+        return _rTotal / _INITIAL_SUPPLY;
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // OWNER-ONLY CONFIGURATION
+    // ───────────────────────────────────────────────────────────────────
+
+    /// @notice Flip trading live so everyone can transfer
+    function enableTrading() external onlyOwner {
+        tradingEnabled = true;
+        emit TradingEnabled();
+    }
+
+    /// @notice Pause all transfers in emergencies
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpause transfers
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @notice Set or unset fee & cooldown exemption
+    function setFeeExclusion(address acct, bool excluded) external onlyOwner {
+        _isExcludedFromFee[acct] = excluded;
+        emit FeeExclusion(acct, excluded);
+    }
+
+    /// @notice Blacklist or unblacklist a user
+    function blacklist(address user, bool flag) external onlyOwner {
+        _isBlacklisted[user] = flag;
+        emit Blacklisted(user, flag);
+    }
+
+    /// @notice Change per-address cooldown (seconds)
+    function setCooldown(uint256 newCd) external onlyOwner {
+        emit CooldownUpdated(cooldown, newCd);
+        cooldown = newCd;
+    }
+
+    /// @notice Update reflection & burn fees (bp). Must stay ≤ caps.
+    function setFees(uint16 _reflectionBP, uint16 _burnBP) external onlyOwner {
+        require(_reflectionBP <= MAX_REFLECTION_FEE, "JINDO: reflection cap");
+        require(_burnBP       <= MAX_BURN_FEE,       "JINDO: burn cap");
+        reflectionFeeBP = _reflectionBP;
+        burnFeeBP       = _burnBP;
+        emit FeesUpdated(_reflectionBP, _burnBP);
+    }
+
+    /// @notice Update dev wallet (fee-exempt)
+    function setDevWallet(address newW) external onlyOwner {
+        require(newW != address(0), "JINDO: zero addr");
+        emit DevWalletUpdated(devWallet, newW);
+        devWallet = newW;
+    }
+
+    /// @notice Update treasury wallet (fee-exempt)
+    function setTreasuryWallet(address newW) external onlyOwner {
+        require(newW != address(0), "JINDO: zero addr");
+        emit TreasuryWalletUpdated(treasuryWallet, newW);
+        treasuryWallet = newW;
+    }
+
+    /// @notice Update liquidity wallet (fee-exempt)
+    function setLiquidityWallet(address newW) external onlyOwner {
+        require(newW != address(0), "JINDO: zero addr");
+        emit LiquidityWalletUpdated(liquidityWallet, newW);
+        liquidityWallet = newW;
+    }
+
+    /// @notice Update burn wallet (always taxed)
+    function setBurnWallet(address newW) external onlyOwner {
+        require(newW != address(0), "JINDO: zero addr");
+        emit BurnWalletUpdated(burnWallet, newW);
+        burnWallet = newW;
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ASSET RECOVERY
+    // ───────────────────────────────────────────────────────────────────
+
+    /// @notice Recover any ERC20 tokens sent here by mistake
+    function recoverERC20(address token, uint256 amount, address to) external onlyOwner {
+        IERC20Upgradeable(token).transfer(to, amount);
+        emit RecoveredERC20(token, to, amount);
+    }
+
+    /// @notice Recover any ETH sent here by mistake
+    function recoverETH(address to, uint256 amount) external onlyOwner {
+        payable(to).transfer(amount);
+        emit RecoveredETH(to, amount);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // UUPS AUTHORIZATION
+    // ───────────────────────────────────────────────────────────────────
+
+    function _authorizeUpgrade(address newImpl) internal override onlyOwner {}
+}
